@@ -63,6 +63,7 @@ local VIEW_MODE_DETAIL = 2
 local viewMode = VIEW_MODE_LIST
 local selectedItem = nil
 local currentFilteredItems = {}  -- Store current items for row click detection
+local scrollOffset = 0
  
 -- ===== Layout config =====
 local COL = {
@@ -492,6 +493,15 @@ local function drawHeader(nameW)
   
   -- Author line
   monitor.setCursorPos(1,2)
+  monitor.setBackgroundColor(colors.gray)
+  monitor.setTextColor(colors.white)
+  monitor.write(" ▲ ")
+
+  monitor.setCursorPos(5,2)
+  monitor.write(" ▼ ")
+  monitor.setBackgroundColor(colors.black)
+
+  monitor.setCursorPos(9,2)
   monitor.setTextColor(colors.lightGray)
   monitor.write("Author: NorskIT, 14122025")
   
@@ -923,6 +933,11 @@ local function render()
   local filteredItems = filterItems(items)
   sortItems(filteredItems)
   currentFilteredItems = filteredItems  -- Store for row click detection
+
+  local visibleRows = math.max(0, h - 5)
+  local maxOffset = math.max(0, #filteredItems - visibleRows)
+  if scrollOffset > maxOffset then scrollOffset = maxOffset end
+  if scrollOffset < 0 then scrollOffset = 0 end
   
   print("Total items: " .. #items .. ", Filtered: " .. #filteredItems .. ", SortCol: " .. sortColumn .. ", TypeFilter: " .. typeFilter)
  
@@ -955,10 +970,13 @@ local function render()
   else
     local itemIndex = 0
     local window = getTimeWindow()
-    for _, item in ipairs(filteredItems) do
+    local startIndex = scrollOffset + 1
+    local endIndex = math.min(#filteredItems, scrollOffset + visibleRows)
+    for idx = startIndex, endIndex do
+      local item = filteredItems[idx]
       if row > h then break end
       local delta = computeRate(item, window)
-      local isEven = (itemIndex % 2) == 0
+      local isEven = ((row - 6) % 2) == 0
       drawRow(row, item, delta, nameW, w, isEven)
       row = row + 1
       itemIndex = itemIndex + 1
@@ -975,7 +993,18 @@ end
  
 local function handleTouch(x, y, w)
   local nameW = w - (COL.MOD + COL.TYPE + COL.DELTA + COL.AMOUNT + 5)
-  
+
+  local visibleRows = math.max(0, select(2, monitor.getSize()) - 5)
+
+  -- Scroll buttons (row 2, left side)
+  if y == 2 and x >= 1 and x <= 3 then
+    scrollOffset = math.max(0, scrollOffset - visibleRows)
+    return true
+  elseif y == 2 and x >= 5 and x <= 7 then
+    scrollOffset = scrollOffset + visibleRows
+    return true
+  end
+
   -- X button in detail view (row 1, right side)
   if viewMode == VIEW_MODE_DETAIL and y == 1 and x >= w - 3 then
     print("X button clicked - returning to list")
@@ -1000,6 +1029,7 @@ local function handleTouch(x, y, w)
     print("Time unit button clicked!")
     timeUnit = timeUnit + 1
     if timeUnit > 4 then timeUnit = 1 end
+    scrollOffset = 0
     return true
   end
   
@@ -1019,6 +1049,7 @@ local function handleTouch(x, y, w)
     print("Type button clicked!")
     typeFilter = typeFilter + 1
     if typeFilter > 4 then typeFilter = 1 end
+    scrollOffset = 0
     return true
   end
   
@@ -1035,6 +1066,7 @@ local function handleTouch(x, y, w)
         sortColumn = SORT_MOD
         sortDescending = true
       end
+      scrollOffset = 0
       return true
     end
     colPos = colPos + COL.MOD + 1
@@ -1048,6 +1080,7 @@ local function handleTouch(x, y, w)
         sortColumn = SORT_TYPE
         sortDescending = true
       end
+      scrollOffset = 0
       return true
     end
     colPos = colPos + COL.TYPE + 1
@@ -1061,6 +1094,7 @@ local function handleTouch(x, y, w)
         sortColumn = SORT_NAME
         sortDescending = false
       end
+      scrollOffset = 0
       return true
     end
     colPos = colPos + nameW + 1
@@ -1074,6 +1108,7 @@ local function handleTouch(x, y, w)
         sortColumn = SORT_DELTA
         sortDescending = true
       end
+      scrollOffset = 0
       return true
     end
     colPos = colPos + COL.DELTA + 1
@@ -1087,13 +1122,14 @@ local function handleTouch(x, y, w)
         sortColumn = SORT_AMOUNT
         sortDescending = true
       end
+      scrollOffset = 0
       return true
     end
   end
-  
+
   -- Row clicks (data rows start at row 6)
   if y >= 6 and currentFilteredItems then
-    local rowIndex = y - 6 + 1
+    local rowIndex = scrollOffset + y - 6 + 1
     if rowIndex > 0 and rowIndex <= #currentFilteredItems then
       local item = currentFilteredItems[rowIndex]
       print("Row clicked: " .. (item.displayName or item.name))
@@ -1118,14 +1154,12 @@ while true do
   
     if event == "monitor_touch" then
       local side, x, y = p1, p2, p3
-      if side == "right" then
-        local w, h = monitor.getSize()
-        local touched = handleTouch(x, y, w)
-        if touched then
-          print("Touch handled at " .. x .. "," .. y)
-          -- Render immediately after touch
-          pcall(render)
-        end
+      local w, h = monitor.getSize()
+      local touched = handleTouch(x, y, w)
+      if touched then
+        print("Touch handled at " .. x .. "," .. y)
+        -- Render immediately after touch
+        pcall(render)
       end
     elseif event == "timer" and p1 == timer then
       -- Timer fired, loop will render again
