@@ -1,0 +1,1133 @@
+-- ae_board.lua
+-- Fixed: separator line + wider mod column
+ 
+-- License: MIT 
+ 
+--[[
+| Resource   | AE2 channel | Queryable |
+|------------|:-----------:|:---------:|
+| Items      | Item        |    ✅     |
+| Fluids     | Fluid       |    ✅     |
+| Chemicals  | Chemical    |    ✅     |
+| Energy     |      ❌      |    ❌     |
+| Souls      |      ❌      |    ❌     |
+| Source     |      ❌      |    ❌     |
+]]
+ 
+ 
+ 
+local bridge = peripheral.find("me_bridge")
+local monitor = peripheral.find("monitor")
+ 
+local programStartTime = os.clock()
+monitor.setTextScale(0.5)
+ 
+-- Set custom color palette for subtle alternating rows
+-- Redefine brown to be a very dark gray (hex 0x222222)
+monitor.setPaletteColor(colors.brown, 0x222222)
+ 
+-- ===== Sort Columns =====
+local SORT_MOD = 1
+local SORT_TYPE = 2
+local SORT_NAME = 3
+local SORT_DELTA = 4
+local SORT_AMOUNT = 5
+local sortColumn = SORT_AMOUNT
+local sortDescending = true
+ 
+-- ===== Type Filter =====
+local TYPE_ALL = 1
+local TYPE_ITEM = 2
+local TYPE_FLUID = 3
+local TYPE_CHEMICAL = 4
+local typeFilter = TYPE_ALL
+ 
+-- ===== Time Unit =====
+local UNIT_SECOND = 1
+local UNIT_MINUTE = 2
+local UNIT_HOUR = 3
+local UNIT_DAY = 4
+local timeUnit = UNIT_SECOND
+ 
+-- ===== State =====
+-- Ring buffer: samples absolute counts every second
+-- [fingerprint] = { {time, count}, {time, count}, ... }
+local itemHistory = {}
+local historyStartTime = os.clock()
+local lastSampleTime = 0
+local MAX_HISTORY_SECONDS = 86400  -- 24 hours
+ 
+-- ===== Detail View State =====
+local VIEW_MODE_LIST = 1
+local VIEW_MODE_DETAIL = 2
+local viewMode = VIEW_MODE_LIST
+local selectedItem = nil
+local currentFilteredItems = {}  -- Store current items for row click detection
+ 
+-- ===== Layout config =====
+local COL = {
+  MOD    = 18,  -- was 14
+  TYPE   = 6,   -- Type column
+  DELTA  = 12,  -- Wider for /h and /d values
+  AMOUNT = 14
+}
+ 
+-- ===== Colors =====
+local MOD_COLORS = {
+  colors.cyan, colors.orange, colors.lime, colors.lightBlue,
+  colors.magenta, colors.yellow, colors.pink, colors.lightGray
+}
+local modColorCache = {}
+ 
+-- ===== Utility =====
+local function getMod(name)
+  return (name or ""):match("^(.-):") or "unknown"
+end
+ 
+local function getItemCount(item)
+  local count = item.count or 0
+  if item._type == "fluid" then
+    return count / 1000  -- Fluids are stored in millibuckets (1000 mB = 1 bucket)
+  end
+  return count
+end
+ 
+local function getModColor(mod)
+  if modColorCache[mod] then return modColorCache[mod] end
+  local hash = 0
+  for i = 1, #mod do hash = hash + mod:byte(i) end
+  local color = MOD_COLORS[(hash % #MOD_COLORS) + 1]
+  modColorCache[mod] = color
+  return color
+end
+ 
+local function fmt(n)
+  n = math.floor(n)
+  
+  if n >= 1000000000 then
+    return string.format("%.1fB", n / 1000000000)
+  elseif n >= 1000000 then
+    return string.format("%.1fM", n / 1000000)
+  elseif n >= 1000 then
+    return string.format("%.1fK", n / 1000)
+  else
+    return tostring(n)
+  end
+end
+ 
+local function writeColoredNumber(n)
+  n = math.floor(n)
+  
+  if n >= 1000000000 then
+    monitor.setTextColor(colors.purple)
+    monitor.write(string.format("%.1fB", n / 1000000000))
+  elseif n >= 1000000 then
+    monitor.setTextColor(colors.orange)
+    monitor.write(string.format("%.1fM", n / 1000000))
+  elseif n >= 1000 then
+    monitor.setTextColor(colors.yellow)
+    monitor.write(string.format("%.1fK", n / 1000))
+  else
+    monitor.setTextColor(colors.white)
+    monitor.write(tostring(n))
+  end
+end
+ 
+local function getItemType(item)
+  -- Use the type tag we added when fetching
+  if item._type == "fluid" then
+    return "FLD", colors.blue
+  elseif item._type == "chemical" then
+    return "CHM", colors.lightGray
+  else
+    return "ITM", colors.white
+  end
+end
+ 
+-- ===== Data =====
+local function fetchItems()
+  if not bridge then
+    return {}
+  end
+  
+  local allItems = {}
+  
+  -- Fetch items (new API 0.8+)
+  if bridge.getItems then
+    local success, items = pcall(bridge.getItems, {})
+    if success and items then
+      for _, item in ipairs(items) do
+        item._type = "item"
+        table.insert(allItems, item)
+      end
+    end
+  end
+  
+  -- Fetch fluids (new API 0.8+)
+  if bridge.getFluids then
+    local success, fluids = pcall(bridge.getFluids, {})
+    if success and fluids then
+      for _, fluid in ipairs(fluids) do
+        fluid._type = "fluid"
+        table.insert(allItems, fluid)
+      end
+    end
+  end
+  
+  -- Fetch chemicals/gases (new API 0.8+ with Mekanism)
+  if bridge.getChemicals then
+    local success, chemicals = pcall(bridge.getChemicals, {})
+    if success and chemicals then
+      for _, chemical in ipairs(chemicals) do
+        chemical._type = "chemical"
+        table.insert(allItems, chemical)
+      end
+    end
+  end
+  
+  return allItems
+end
+ 
+-- Sample absolute item counts into ring buffer
+-- Only sample once per second to ensure accurate time windows
+local function trackHistory(items)
+  local now = os.clock()
+  local elapsed = now - historyStartTime
+  
+  -- Only sample once per second
+  if elapsed - lastSampleTime < 1 then
+    return
+  end
+  
+  print("Sampling at " .. string.format("%.1f", elapsed) .. "s (last: " .. string.format("%.1f", lastSampleTime) .. "s)")
+  lastSampleTime = elapsed
+  
+  for _, item in ipairs(items) do
+    local key = item.fingerprint or item.name
+    if not itemHistory[key] then
+      itemHistory[key] = {}
+    end
+    
+    local count = getItemCount(item)
+    table.insert(itemHistory[key], {time = elapsed, count = count})
+    
+    -- Keep only last 24 hours of data (86400 seconds)
+    while #itemHistory[key] > 0 and itemHistory[key][1].time < elapsed - MAX_HISTORY_SECONDS do
+      table.remove(itemHistory[key], 1)
+    end
+  end
+end
+ 
+-- Find sample closest to X seconds ago (but not newer than that)
+local function findHistorySample(history, secondsAgo)
+  if not history or #history < 2 then
+    return nil
+  end
+  
+  local now = os.clock()
+  local elapsed = now - historyStartTime
+  local targetTime = elapsed - secondsAgo
+  
+  -- Find the sample closest to targetTime, but prefer older samples
+  local closest = nil
+  local closestDiff = math.huge
+  
+  for _, sample in ipairs(history) do
+    -- Only consider samples that are old enough (at or before targetTime)
+    if sample.time <= targetTime then
+      local diff = targetTime - sample.time
+      if diff < closestDiff then
+        closestDiff = diff
+        closest = sample
+      end
+    end
+  end
+  
+  -- If no old enough sample found, use the oldest available
+  if not closest and #history > 0 then
+    closest = history[1]
+  end
+  
+  return closest
+end
+ 
+-- Compute rate based on actual diff over time window
+-- Returns the TOTAL change over the window (not per-second rate)
+local function computeRate(item, secondsAgo)
+  local key = item.fingerprint or item.name
+  local history = itemHistory[key]
+  
+  if not history or #history < 2 then
+    return 0
+  end
+  
+  local nowSample = history[#history]  -- Latest sample
+  local oldSample = findHistorySample(history, secondsAgo)
+  
+  if not oldSample then
+    return 0
+  end
+  
+  -- Check that we have enough time difference
+  local timeDiff = nowSample.time - oldSample.time
+  if timeDiff < 0.5 then  -- Less than half a second difference
+    return 0
+  end
+  
+  -- Return total delta over the time window
+  local delta = nowSample.count - oldSample.count
+  return delta
+end
+ 
+-- Get time window in seconds based on current unit selection
+local function getTimeWindow()
+  if timeUnit == UNIT_SECOND then
+    return 1
+  elseif timeUnit == UNIT_MINUTE then
+    return 60
+  elseif timeUnit == UNIT_HOUR then
+    return 3600
+  elseif timeUnit == UNIT_DAY then
+    return 86400
+  end
+  return 1
+end
+ 
+local function sortItems(items)
+  -- Pre-calculate delta values if sorting by delta to avoid recalculating during sort
+  local deltaCache = {}
+  if sortColumn == SORT_DELTA then
+    local window = getTimeWindow()
+    for _, item in ipairs(items) do
+      local key = item.fingerprint or item.name
+      deltaCache[key] = computeRate(item, window)
+    end
+  end
+  
+  table.sort(items, function(a, b)
+    local aVal, bVal
+    
+    if sortColumn == SORT_MOD then
+      aVal = getMod(a.name)
+      bVal = getMod(b.name)
+    elseif sortColumn == SORT_TYPE then
+      aVal = getItemType(a)
+      bVal = getItemType(b)
+    elseif sortColumn == SORT_NAME then
+      aVal = a.displayName or a.name or ""
+      bVal = b.displayName or b.name or ""
+    elseif sortColumn == SORT_DELTA then
+      local aKey = a.fingerprint or a.name
+      local bKey = b.fingerprint or b.name
+      aVal = deltaCache[aKey] or 0
+      bVal = deltaCache[bKey] or 0
+    else -- SORT_AMOUNT
+      aVal = getItemCount(a)
+      bVal = getItemCount(b)
+    end
+    
+    -- Primary sort
+    if aVal ~= bVal then
+      if sortDescending then
+        return aVal > bVal
+      else
+        return aVal < bVal
+      end
+    end
+    
+    -- Secondary sort by name when values are equal
+    local aName = a.displayName or a.name or ""
+    local bName = b.displayName or b.name or ""
+    return aName < bName
+  end)
+end
+ 
+local function filterItems(items)
+  local filtered = {}
+  
+  -- Filter by type only
+  for _, item in ipairs(items) do
+    local typeIcon = getItemType(item)
+    local shouldInclude = false
+    
+    if typeFilter == TYPE_ALL then
+      shouldInclude = true
+    elseif typeFilter == TYPE_ITEM and typeIcon == "ITM" then
+      shouldInclude = true
+    elseif typeFilter == TYPE_FLUID and typeIcon == "FLD" then
+      shouldInclude = true
+    elseif typeFilter == TYPE_CHEMICAL and typeIcon == "CHM" then
+      shouldInclude = true
+    end
+    
+    if shouldInclude then
+      table.insert(filtered, item)
+    end
+  end
+  
+  return filtered
+end
+ 
+local function drawButtons(w)
+  -- Time unit button (row 1, right side)
+  local unitName = "/s"
+  if timeUnit == UNIT_MINUTE then
+    unitName = "/m"
+  elseif timeUnit == UNIT_HOUR then
+    unitName = "/h"
+  elseif timeUnit == UNIT_DAY then
+    unitName = "/d"
+  end
+  
+  local unitLabel = " Unit: " .. unitName .. " "
+  local unitStartPos = w - #unitLabel + 1
+  if unitStartPos < 1 then unitStartPos = 1 end
+  
+  monitor.setCursorPos(unitStartPos, 1)
+  monitor.setBackgroundColor(colors.purple)
+  monitor.setTextColor(colors.white)
+  monitor.write(unitLabel)
+  monitor.setBackgroundColor(colors.black)
+  
+  -- Type filter button (row 2, right side)
+  local typeName = "ALL"
+  if typeFilter == TYPE_ITEM then
+    typeName = "ITEMS"
+  elseif typeFilter == TYPE_FLUID then
+    typeName = "FLUIDS"
+  elseif typeFilter == TYPE_CHEMICAL then
+    typeName = "CHEMICALS"
+  end
+  
+  local typeLabel = " Type: " .. typeName .. " "
+  local typeStartPos = w - #typeLabel + 1
+  if typeStartPos < 1 then typeStartPos = 1 end
+  
+  monitor.setCursorPos(typeStartPos, 2)
+  monitor.setBackgroundColor(colors.orange)
+  monitor.setTextColor(colors.black)
+  monitor.write(typeLabel)
+  monitor.setBackgroundColor(colors.black)
+end
+ 
+-- ===== Drawing =====
+local function clearScreen()
+  monitor.setBackgroundColor(colors.black)
+  monitor.clear()
+end
+ 
+local function drawTableLine(w, nameW, char)
+  monitor.setTextColor(colors.gray)
+  local line = string.rep(char, COL.MOD) .. "+" 
+  line = line .. string.rep(char, COL.TYPE) .. "+"
+  line = line .. string.rep(char, nameW) .. "+"
+  line = line .. string.rep(char, COL.DELTA) .. "+"
+  line = line .. string.rep(char, COL.AMOUNT + 1)
+  monitor.write(line:sub(1, w))
+end
+ 
+local function drawSeparator(row, w, nameW)
+  monitor.setCursorPos(1, row)
+  drawTableLine(w, nameW, "-")
+end
+ 
+local function drawProgressBar(x, y, width, percent, label)
+  -- Draw label
+  monitor.setCursorPos(x, y)
+  monitor.setTextColor(colors.white)
+  monitor.write(label .. ": ")
+  
+  local labelLen = #label + 2
+  local barWidth = width - labelLen - 6  -- Leave space for percentage
+  local filled = math.floor(barWidth * (percent / 100))
+  
+  -- Draw bar background
+  monitor.setTextColor(colors.gray)
+  monitor.write("[")
+  
+  -- Draw filled portion
+  local barColor = colors.lime
+  if percent > 90 then
+    barColor = colors.red
+  elseif percent > 70 then
+    barColor = colors.yellow
+  end
+  
+  monitor.setTextColor(barColor)
+  for i = 1, filled do
+    monitor.write("=")
+  end
+  
+  -- Draw empty portion
+  monitor.setTextColor(colors.gray)
+  for i = filled + 1, barWidth do
+    monitor.write("-")
+  end
+  
+  monitor.write("]")
+  
+  -- Draw percentage
+  monitor.setTextColor(barColor)
+  monitor.write(string.format("%3.0f%%", percent))
+end
+ 
+local function drawStats(w, stats)
+  -- Draw progress bars using pre-fetched stats
+  local barWidth = math.floor(w / 3) - 2
+  
+  drawProgressBar(1, 3, barWidth, stats.itemPct, "Items")
+  drawProgressBar(barWidth + 3, 3, barWidth, stats.fluidPct, "Fluids")
+  drawProgressBar(barWidth * 2 + 5, 3, barWidth, stats.energyPct, "Energy")
+end
+ 
+local function drawHeader(nameW)
+  -- Runtime timer
+  local runtime = os.clock() - programStartTime
+  local hours = math.floor(runtime / 3600)
+  local minutes = math.floor((runtime % 3600) / 60)
+  local seconds = math.floor(runtime % 60)
+  monitor.setCursorPos(1,1)
+  monitor.setTextColor(colors.lime)
+  monitor.write(string.format("Runtime: %02d:%02d:%02d", hours, minutes, seconds))
+  
+  -- Author line
+  monitor.setCursorPos(1,2)
+  monitor.setTextColor(colors.lightGray)
+  monitor.write("Author: NorskIT, 14122025")
+  
+  -- Header row with clickable columns
+  monitor.setCursorPos(1,4)
+  
+  local arrow = sortDescending and " \31" or " \30"  -- ▼ or ▲
+  
+  -- Mod column
+  monitor.setBackgroundColor(sortColumn == SORT_MOD and colors.gray or colors.black)
+  monitor.setTextColor(sortColumn == SORT_MOD and colors.yellow or colors.cyan)
+  local modText = "MOD" .. (sortColumn == SORT_MOD and arrow or "")
+  monitor.write(modText .. string.rep(" ", COL.MOD - #modText))
+  monitor.setBackgroundColor(colors.black)
+  monitor.setTextColor(colors.gray)
+  monitor.write("|")
+  
+  -- Type column  
+  monitor.setBackgroundColor(sortColumn == SORT_TYPE and colors.gray or colors.black)
+  monitor.setTextColor(sortColumn == SORT_TYPE and colors.yellow or colors.cyan)
+  local typeText = "TYPE" .. (sortColumn == SORT_TYPE and arrow or "")
+  monitor.write(typeText .. string.rep(" ", COL.TYPE - #typeText))
+  monitor.setBackgroundColor(colors.black)
+  monitor.setTextColor(colors.gray)
+  monitor.write("|")
+  
+  -- Name column
+  monitor.setBackgroundColor(sortColumn == SORT_NAME and colors.gray or colors.black)
+  monitor.setTextColor(sortColumn == SORT_NAME and colors.yellow or colors.cyan)
+  local nameText = " ITEM NAME" .. (sortColumn == SORT_NAME and arrow or "")
+  monitor.write(nameText .. string.rep(" ", math.max(0, nameW - #nameText)))
+  monitor.setBackgroundColor(colors.black)
+  monitor.setTextColor(colors.gray)
+  monitor.write("|")
+  
+  -- Delta column (show current unit)
+  local unitSuffix = "/s"
+  if timeUnit == UNIT_MINUTE then
+    unitSuffix = "/m"
+  elseif timeUnit == UNIT_HOUR then
+    unitSuffix = "/h"
+  elseif timeUnit == UNIT_DAY then
+    unitSuffix = "/d"
+  end
+  
+  monitor.setBackgroundColor(sortColumn == SORT_DELTA and colors.gray or colors.black)
+  monitor.setTextColor(sortColumn == SORT_DELTA and colors.yellow or colors.cyan)
+  local deltaHeaderText = " Δ" .. unitSuffix .. (sortColumn == SORT_DELTA and arrow or "")
+  monitor.write(deltaHeaderText .. string.rep(" ", math.max(0, COL.DELTA - #deltaHeaderText)))
+  monitor.setBackgroundColor(colors.black)
+  monitor.setTextColor(colors.gray)
+  monitor.write("|")
+  
+  -- Amount column
+  monitor.setBackgroundColor(sortColumn == SORT_AMOUNT and colors.gray or colors.black)
+  monitor.setTextColor(sortColumn == SORT_AMOUNT and colors.yellow or colors.cyan)
+  local amountText = " AMOUNT" .. (sortColumn == SORT_AMOUNT and arrow or "")
+  monitor.write(amountText)
+  monitor.setBackgroundColor(colors.black)
+end
+ 
+local function drawRow(row, item, deltaSec, nameW, screenW, isEven)
+  local mod = getMod(item.name)
+  local name = item.displayName or item.name
+  local count = getItemCount(item)
+ 
+  -- Delta is total change over time window (not extrapolated)
+  local deltaValue = deltaSec  -- This is already the total delta for the window
+  local deltaText = "/s"
+  
+  if timeUnit == UNIT_MINUTE then
+    deltaText = "/m"
+  elseif timeUnit == UNIT_HOUR then
+    deltaText = "/h"
+  elseif timeUnit == UNIT_DAY then
+    deltaText = "/d"
+  end
+ 
+  -- MOD - pad to column width (black background)
+  local modText = mod:sub(1, COL.MOD - 1)
+  modText = modText .. string.rep(" ", COL.MOD - #modText)
+  
+  monitor.setCursorPos(1, row)
+  monitor.setBackgroundColor(colors.black)
+  monitor.setTextColor(getModColor(mod))
+  monitor.write(modText)
+ 
+  -- Separator
+  monitor.setTextColor(colors.lightGray)
+  monitor.write("|")
+ 
+  -- TYPE - pad to column width (black background)
+  local typeIcon, typeColor = getItemType(item)
+  local typeText = typeIcon .. string.rep(" ", COL.TYPE - #typeIcon)
+  
+  monitor.setBackgroundColor(colors.black)
+  monitor.setTextColor(typeColor)
+  monitor.write(typeText)
+ 
+  -- Separator
+  monitor.setTextColor(colors.lightGray)
+  monitor.write("|")
+ 
+  -- NAME - pad to column width (alternating background)
+  local nameText = " " .. name:sub(1, nameW - 2)
+  nameText = nameText .. string.rep(" ", nameW - #nameText)
+  
+  if isEven then
+    monitor.setBackgroundColor(colors.black)
+  else
+    monitor.setBackgroundColor(colors.brown)
+  end
+  monitor.setTextColor(colors.white)
+  monitor.write(nameText)
+ 
+  -- Separator (back to black background)
+  monitor.setBackgroundColor(colors.black)
+  monitor.setTextColor(colors.lightGray)
+  monitor.write("|")
+ 
+  -- DELTA - pad to column width
+  local deltaNum = fmt(math.abs(deltaValue))
+  local sign = deltaValue > 0 and "+" or (deltaValue < 0 and "-" or "")
+  local fullStr = sign .. deltaNum .. deltaText
+  local padding = string.rep(" ", COL.DELTA - #fullStr - 1)
+  
+  monitor.write(" " .. padding)
+  
+  if deltaValue > 0 then
+    monitor.setTextColor(colors.lime)
+  elseif deltaValue < 0 then
+    monitor.setTextColor(colors.red)
+  else
+    monitor.setTextColor(colors.lightGray)
+  end
+  monitor.write(fullStr)
+ 
+  -- Separator
+  monitor.setTextColor(colors.lightGray)
+  monitor.write("|")
+ 
+  -- AMOUNT - right aligned within column
+  local amt = fmt(count)
+  local padding = string.rep(" ", COL.AMOUNT - #amt)
+  monitor.setTextColor(colors.white)
+  monitor.write(padding)
+  writeColoredNumber(count)
+  
+  -- Reset background
+  monitor.setBackgroundColor(colors.black)
+end
+ 
+-- ===== Detail View =====
+local function calculateStats(data, timeWindow)
+  local now = os.clock() - historyStartTime
+  
+  -- Filter data to time window
+  local filtered = {}
+  for _, point in ipairs(data) do
+    if point.time >= now - timeWindow then
+      table.insert(filtered, point)
+    end
+  end
+  
+  if #filtered < 2 then
+    return nil
+  end
+  
+  local first = filtered[1]
+  local last = filtered[#filtered]
+  local change = last.count - first.count
+  local timeSpan = last.time - first.time
+  local rate = timeSpan > 0 and (change / timeSpan) or 0
+  
+  local minCount = first.count
+  local maxCount = first.count
+  for _, point in ipairs(filtered) do
+    if point.count < minCount then minCount = point.count end
+    if point.count > maxCount then maxCount = point.count end
+  end
+  
+  return {
+    change = change,
+    rate = rate,
+    min = minCount,
+    max = maxCount,
+    samples = #filtered
+  }
+end
+ 
+local function renderDetailView()
+  if not selectedItem then
+    viewMode = VIEW_MODE_LIST
+    return
+  end
+  
+  -- Update selected item's current count
+  local items = fetchItems()
+  local key = selectedItem.fingerprint or selectedItem.name
+  for _, item in ipairs(items) do
+    local itemKey = item.fingerprint or item.name
+    if itemKey == key then
+      selectedItem = item  -- Update with current data
+      break
+    end
+  end
+  
+  local w, h = monitor.getSize()
+  
+  monitor.setBackgroundColor(colors.black)
+  monitor.clear()
+  
+  -- Title
+  monitor.setCursorPos(1, 1)
+  monitor.setTextColor(colors.cyan)
+  monitor.write("Detail: " .. (selectedItem.displayName or selectedItem.name))
+  
+  -- X button
+  monitor.setCursorPos(w - 3, 1)
+  monitor.setBackgroundColor(colors.red)
+  monitor.setTextColor(colors.white)
+  monitor.write(" X ")
+  monitor.setBackgroundColor(colors.black)
+  
+  -- Basic info
+  local line = 3
+  monitor.setCursorPos(1, line)
+  monitor.setTextColor(colors.white)
+  monitor.write("Mod: ")
+  monitor.setTextColor(getModColor(getMod(selectedItem.name)))
+  monitor.write(getMod(selectedItem.name))
+  line = line + 1
+  
+  monitor.setCursorPos(1, line)
+  monitor.setTextColor(colors.white)
+  monitor.write("Type: ")
+  local typeIcon, typeColor = getItemType(selectedItem)
+  monitor.setTextColor(typeColor)
+  monitor.write(typeIcon)
+  line = line + 1
+  
+  monitor.setCursorPos(1, line)
+  monitor.setTextColor(colors.white)
+  monitor.write("ID: ")
+  monitor.setTextColor(colors.lightGray)
+  monitor.write(selectedItem.name)
+  line = line + 1
+  
+  monitor.setCursorPos(1, line)
+  monitor.setTextColor(colors.white)
+  monitor.write("Craftable: ")
+  monitor.setTextColor(selectedItem.isCraftable and colors.lime or colors.red)
+  monitor.write(tostring(selectedItem.isCraftable or false))
+  line = line + 2
+  
+  -- Current amount
+  monitor.setCursorPos(1, line)
+  monitor.setTextColor(colors.cyan)
+  monitor.write("=== CURRENT AMOUNT ===")
+  line = line + 1
+  monitor.setCursorPos(1, line)
+  writeColoredNumber(getItemCount(selectedItem))
+  line = line + 2
+  
+  -- Storage usage
+  monitor.setCursorPos(1, line)
+  monitor.setTextColor(colors.cyan)
+  monitor.write("=== STORAGE USAGE ===")
+  line = line + 1
+  
+  local used, total, storageType
+  local itemType = getItemType(selectedItem)
+  
+  if itemType == "FLD" then
+    used = bridge.getUsedFluidStorage and bridge.getUsedFluidStorage() or 0
+    total = bridge.getTotalFluidStorage and bridge.getTotalFluidStorage() or 0
+    storageType = "Fluid"
+  elseif itemType == "CHM" then
+    used = bridge.getUsedFluidStorage and bridge.getUsedFluidStorage() or 0
+    total = bridge.getTotalFluidStorage and bridge.getTotalFluidStorage() or 0
+    storageType = "Chemical"
+  else
+    used = bridge.getUsedItemStorage and bridge.getUsedItemStorage() or 0
+    total = bridge.getTotalItemStorage and bridge.getTotalItemStorage() or 0
+    storageType = "Item"
+  end
+  
+  local percentage = total > 0 and (used / total * 100) or 0
+  
+  monitor.setCursorPos(1, line)
+  monitor.setTextColor(colors.white)
+  monitor.write(storageType .. " Storage: ")
+  writeColoredNumber(used)
+  monitor.setTextColor(colors.white)
+  monitor.write(" / ")
+  writeColoredNumber(total)
+  monitor.write(string.format(" (%.1f%%)", percentage))
+  line = line + 1
+  
+  -- Progress bar for storage
+  local barWidth = w - 2
+  monitor.setCursorPos(1, line)
+  monitor.setTextColor(colors.white)
+  monitor.write("[")
+  
+  local filled = math.floor((percentage / 100) * barWidth)
+  local barColor = colors.lime
+  if percentage > 90 then
+    barColor = colors.red
+  elseif percentage > 70 then
+    barColor = colors.yellow
+  end
+  
+  monitor.setTextColor(barColor)
+  for i = 1, filled do
+    monitor.write("=")
+  end
+  
+  monitor.setTextColor(colors.gray)
+  for i = filled + 1, barWidth do
+    monitor.write("-")
+  end
+  
+  monitor.setTextColor(colors.white)
+  monitor.write("]")
+  line = line + 2
+  
+  local history = itemHistory[key] or {}
+  
+  if #history < 2 then
+    monitor.setCursorPos(1, line)
+    monitor.setTextColor(colors.yellow)
+    monitor.write("Collecting history... (" .. #history .. " data points)")
+    return
+  end
+  
+  -- Calculate stats for different time windows
+  monitor.setCursorPos(1, line)
+  monitor.setTextColor(colors.cyan)
+  monitor.write("=== STATISTICS ===")
+  line = line + 2
+  
+  local windows = {
+    {name = "Last 1 Minute", time = 60},
+    {name = "Last 10 Minutes", time = 600},
+    {name = "Last 1 Hour", time = 3600}
+  }
+  
+  for _, window in ipairs(windows) do
+    local stats = calculateStats(history, window.time)
+    
+    monitor.setCursorPos(1, line)
+    monitor.setTextColor(colors.yellow)
+    monitor.write(window.name .. ":")
+    line = line + 1
+    
+    if stats then
+      monitor.setCursorPos(3, line)
+      monitor.setTextColor(colors.white)
+      monitor.write("Change: ")
+      local changeColor = stats.change > 0 and colors.lime or (stats.change < 0 and colors.red or colors.gray)
+      monitor.setTextColor(changeColor)
+      monitor.write(stats.change > 0 and "+" or (stats.change < 0 and "" or ""))
+      writeColoredNumber(math.abs(stats.change))
+      line = line + 1
+      
+      monitor.setCursorPos(3, line)
+      monitor.setTextColor(colors.white)
+      monitor.write("Rate: ")
+      monitor.setTextColor(changeColor)
+      monitor.write(string.format("%+.1f/s", stats.rate))
+      line = line + 1
+      
+      monitor.setCursorPos(3, line)
+      monitor.setTextColor(colors.white)
+      monitor.write("Min: ")
+      writeColoredNumber(stats.min)
+      monitor.setTextColor(colors.white)
+      monitor.write("  Max: ")
+      writeColoredNumber(stats.max)
+      line = line + 1
+      
+      monitor.setCursorPos(3, line)
+      monitor.setTextColor(colors.lightGray)
+      monitor.write("Samples: " .. stats.samples)
+      line = line + 2
+    else
+      monitor.setCursorPos(3, line)
+      monitor.setTextColor(colors.red)
+      monitor.write("Not enough data")
+      line = line + 2
+    end
+  end
+end
+ 
+-- ===== Render =====
+local function render()
+  -- Check if we're in detail view
+  if viewMode == VIEW_MODE_DETAIL then
+    renderDetailView()
+    return
+  end
+  
+  local w, h = monitor.getSize()
+  local nameW = w - (COL.MOD + COL.TYPE + COL.DELTA + COL.AMOUNT + 5)
+  if nameW < 8 then nameW = 8 end
+ 
+  -- Fetch ALL data BEFORE clearing screen to avoid flicker
+  local items = fetchItems()
+  
+  -- Track history for detail view
+  trackHistory(items)
+  
+  -- Get storage stats
+  local itemUsed = bridge.getUsedItemStorage and bridge.getUsedItemStorage() or 0
+  local itemTotal = bridge.getTotalItemStorage and bridge.getTotalItemStorage() or 0
+  local fluidUsed = bridge.getUsedFluidStorage and bridge.getUsedFluidStorage() or 0
+  local fluidTotal = bridge.getTotalFluidStorage and bridge.getTotalFluidStorage() or 0
+  local energy = bridge.getStoredEnergy and bridge.getStoredEnergy() or 0
+  local energyCap = bridge.getEnergyCapacity and bridge.getEnergyCapacity() or 0
+  
+  -- Calculate percentages
+  local stats = {
+    itemPct = itemTotal > 0 and (itemUsed / itemTotal * 100) or 0,
+    fluidPct = fluidTotal > 0 and (fluidUsed / fluidTotal * 100) or 0,
+    energyPct = energyCap > 0 and (energy / energyCap * 100) or 0
+  }
+  
+  local filteredItems = filterItems(items)
+  sortItems(filteredItems)
+  currentFilteredItems = filteredItems  -- Store for row click detection
+  
+  print("Total items: " .. #items .. ", Filtered: " .. #filteredItems .. ", SortCol: " .. sortColumn .. ", TypeFilter: " .. typeFilter)
+ 
+  -- Don't clear screen - just overwrite to prevent flicker
+  -- Clear only the first time
+  local firstRender = #itemHistory == 0 or (itemHistory[next(itemHistory)] and #itemHistory[next(itemHistory)] == 1)
+  if firstRender then
+    clearScreen()
+  end
+  
+  drawHeader(nameW)
+  drawButtons(w)
+  drawStats(w, stats)
+  drawSeparator(5, w, nameW)
+ 
+  local row = 6
+  
+  if #filteredItems == 0 then
+    monitor.setCursorPos(1, row)
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.red)
+    monitor.write("No items found")
+    monitor.clearLine()
+    
+    -- Clear remaining lines
+    for clearRow = row + 1, h do
+      monitor.setCursorPos(1, clearRow)
+      monitor.clearLine()
+    end
+  else
+    local itemIndex = 0
+    local window = getTimeWindow()
+    for _, item in ipairs(filteredItems) do
+      if row > h then break end
+      local delta = computeRate(item, window)
+      local isEven = (itemIndex % 2) == 0
+      drawRow(row, item, delta, nameW, w, isEven)
+      row = row + 1
+      itemIndex = itemIndex + 1
+    end
+    
+    -- Clear any remaining lines from previous render
+    for clearRow = row, h do
+      monitor.setCursorPos(1, clearRow)
+      monitor.setBackgroundColor(colors.black)
+      monitor.clearLine()
+    end
+  end
+end
+ 
+local function handleTouch(x, y, w)
+  local nameW = w - (COL.MOD + COL.TYPE + COL.DELTA + COL.AMOUNT + 5)
+  
+  -- X button in detail view (row 1, right side)
+  if viewMode == VIEW_MODE_DETAIL and y == 1 and x >= w - 3 then
+    print("X button clicked - returning to list")
+    viewMode = VIEW_MODE_LIST
+    selectedItem = nil
+    return true
+  end
+  
+  -- Time unit button on row 1 (right side)
+  local unitName = "/s"
+  if timeUnit == UNIT_MINUTE then
+    unitName = "/m"
+  elseif timeUnit == UNIT_HOUR then
+    unitName = "/h"
+  elseif timeUnit == UNIT_DAY then
+    unitName = "/d"
+  end
+  local unitLabel = " Unit: " .. unitName .. " "
+  local unitStartPos = w - #unitLabel + 1
+  
+  if y == 1 and x >= unitStartPos then
+    print("Time unit button clicked!")
+    timeUnit = timeUnit + 1
+    if timeUnit > 4 then timeUnit = 1 end
+    return true
+  end
+  
+  -- Type filter button on row 2 (right side)
+  local typeName = "ALL"
+  if typeFilter == TYPE_ITEM then
+    typeName = "ITEMS"
+  elseif typeFilter == TYPE_FLUID then
+    typeName = "FLUIDS"
+  elseif typeFilter == TYPE_CHEMICAL then
+    typeName = "CHEMICALS"
+  end
+  local typeLabel = " Type: " .. typeName .. " "
+  local typeStartPos = w - #typeLabel + 1
+  
+  if y == 2 and x >= typeStartPos then
+    print("Type button clicked!")
+    typeFilter = typeFilter + 1
+    if typeFilter > 4 then typeFilter = 1 end
+    return true
+  end
+  
+  -- Column header clicks (row 4)
+  if y == 4 then
+    local colPos = 1
+    
+    -- Mod column
+    if x >= colPos and x < colPos + COL.MOD then
+      print("Mod column clicked!")
+      if sortColumn == SORT_MOD then
+        sortDescending = not sortDescending
+      else
+        sortColumn = SORT_MOD
+        sortDescending = true
+      end
+      return true
+    end
+    colPos = colPos + COL.MOD + 1
+    
+    -- Type column
+    if x >= colPos and x < colPos + COL.TYPE then
+      print("Type column clicked!")
+      if sortColumn == SORT_TYPE then
+        sortDescending = not sortDescending
+      else
+        sortColumn = SORT_TYPE
+        sortDescending = true
+      end
+      return true
+    end
+    colPos = colPos + COL.TYPE + 1
+    
+    -- Name column
+    if x >= colPos and x < colPos + nameW then
+      print("Name column clicked!")
+      if sortColumn == SORT_NAME then
+        sortDescending = not sortDescending
+      else
+        sortColumn = SORT_NAME
+        sortDescending = false
+      end
+      return true
+    end
+    colPos = colPos + nameW + 1
+    
+    -- Delta column
+    if x >= colPos and x < colPos + COL.DELTA then
+      print("Delta column clicked!")
+      if sortColumn == SORT_DELTA then
+        sortDescending = not sortDescending
+      else
+        sortColumn = SORT_DELTA
+        sortDescending = true
+      end
+      return true
+    end
+    colPos = colPos + COL.DELTA + 1
+    
+    -- Amount column
+    if x >= colPos then
+      print("Amount column clicked!")
+      if sortColumn == SORT_AMOUNT then
+        sortDescending = not sortDescending
+      else
+        sortColumn = SORT_AMOUNT
+        sortDescending = true
+      end
+      return true
+    end
+  end
+  
+  -- Row clicks (data rows start at row 6)
+  if y >= 6 and currentFilteredItems then
+    local rowIndex = y - 6 + 1
+    if rowIndex > 0 and rowIndex <= #currentFilteredItems then
+      local item = currentFilteredItems[rowIndex]
+      print("Row clicked: " .. (item.displayName or item.name))
+      selectedItem = item
+      viewMode = VIEW_MODE_DETAIL
+      return true
+    end
+  end
+end
+ 
+-- ===== Main loop =====
+-- Render with 1 second pause
+while true do
+    local success, err = pcall(render)
+    if not success then
+      print("Render error: " .. tostring(err))
+    end
+    
+    -- Wait 1 second or until touch event
+    local timer = os.startTimer(1)
+    local event, p1, p2, p3 = os.pullEvent()
+  
+    if event == "monitor_touch" then
+      local side, x, y = p1, p2, p3
+      if side == "right" then
+        local w, h = monitor.getSize()
+        local touched = handleTouch(x, y, w)
+        if touched then
+          print("Touch handled at " .. x .. "," .. y)
+          -- Render immediately after touch
+          pcall(render)
+        end
+      end
+    elseif event == "timer" and p1 == timer then
+      -- Timer fired, loop will render again
+    end
+  end
